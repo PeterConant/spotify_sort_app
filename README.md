@@ -91,5 +91,8 @@ POST /playlists/{playlist_id}/sort
 ## Notes
 
 - Only track items are sorted; podcast episodes and other non-track entries are skipped.
+- You can only sort playlists **you own** or **collaborative playlists** — followed playlists owned by others will return 403.
+- Spotify's 2026 API uses `/playlists/{id}/items` (not `/tracks`). If you previously authenticated, visit `/auth/logout` then `/auth/login` again after updating.
 - Large playlists are rewritten in batches of 100 tracks per Spotify API limits.
 - Use `dry_run: true` first to preview the new order before applying changes.
+- The `popularity` sort field may return identical values — Spotify removed popularity from playlist item responses in 2026.
