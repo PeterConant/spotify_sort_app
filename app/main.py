@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.config import get_settings
-from app.routers import auth, playlists
+from app.routers import auth, debug, playlists
 
 
 @asynccontextmanager
@@ -34,6 +34,7 @@ app.add_middleware(
 )
 
 app.include_router(auth.router)
+app.include_router(debug.router)
 app.include_router(playlists.router)
 
 

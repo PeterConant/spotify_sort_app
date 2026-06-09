@@ -6,10 +6,21 @@ from fastapi import HTTPException, status
 from app.config import Settings, get_settings
 from app.models import PlaylistSummary, TrackSummary
 
-TRACK_FIELDS = (
-    "items(added_at,track(type,id,name,uri,duration_ms,popularity,"
+PLAYLIST_ITEMS_BATCH = 100
+PLAYLIST_ITEMS_PAGE = 50
+
+ITEM_FIELDS = (
+    "items(added_at,item(type,id,name,uri,duration_ms,"
     "artists(name),album(name,release_date))),total,next"
 )
+
+
+def _entry_track(entry: dict[str, Any]) -> dict[str, Any] | None:
+    return entry.get("item") or entry.get("track")
+
+
+def _playlist_items_path(playlist_id: str) -> str:
+    return f"/playlists/{playlist_id}/items"
 
 
 class SpotifyClient:
@@ -50,11 +61,27 @@ class SpotifyClient:
                         detail = str(error)
             except ValueError:
                 pass
+
+            if response.status_code == status.HTTP_403_FORBIDDEN:
+                detail = (
+                    f"{detail} You can only read or modify playlists you own or "
+                    "collaborate on. Followed playlists owned by other users are "
+                    "not supported."
+                )
+
             raise HTTPException(status_code=response.status_code, detail=detail)
 
         if not response.content:
             return {}
         return response.json()
+
+    async def get_raw(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return await self._request("GET", path, params=params)
 
     async def get_current_user(self) -> dict[str, Any]:
         return await self._request("GET", "/me")
@@ -78,7 +105,6 @@ class SpotifyClient:
                         owner=item["owner"]["display_name"] or item["owner"]["id"],
                         public=bool(item.get("public")),
                         collaborative=bool(item.get("collaborative")),
-                        track_count=item["tracks"]["total"],
                         snapshot_id=item.get("snapshot_id"),
                     )
                 )
@@ -92,20 +118,39 @@ class SpotifyClient:
     async def get_playlist(self, playlist_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/playlists/{playlist_id}")
 
+    async def ensure_playlist_modifiable(
+        self, playlist_id: str, current_user_id: str
+    ) -> dict[str, Any]:
+        playlist = await self.get_playlist(playlist_id)
+        owner_id = playlist["owner"]["id"]
+        if owner_id != current_user_id and not playlist.get("collaborative"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "This playlist belongs to another user. Only playlists you "
+                    "own or collaborate on can be sorted."
+                ),
+            )
+        return playlist
+
     async def get_playlist_tracks(self, playlist_id: str) -> list[TrackSummary]:
         tracks: list[TrackSummary] = []
         offset = 0
-        limit = 100
+        items_path = _playlist_items_path(playlist_id)
 
         while True:
             payload = await self._request(
                 "GET",
-                f"/playlists/{playlist_id}/tracks",
-                params={"limit": limit, "offset": offset, "fields": TRACK_FIELDS},
+                items_path,
+                params={
+                    "limit": PLAYLIST_ITEMS_PAGE,
+                    "offset": offset,
+                    "fields": ITEM_FIELDS,
+                },
             )
 
-            for item in payload.get("items", []):
-                track = item.get("track")
+            for entry in payload.get("items", []):
+                track = _entry_track(entry)
                 if not track or track.get("type") != "track" or not track.get("uri"):
                     continue
 
@@ -120,7 +165,7 @@ class SpotifyClient:
                         ),
                         album=album.get("name") or "Unknown Album",
                         duration_ms=int(track.get("duration_ms") or 0),
-                        added_at=item.get("added_at"),
+                        added_at=entry.get("added_at"),
                         popularity=track.get("popularity"),
                         release_date=album.get("release_date"),
                     )
@@ -128,39 +173,41 @@ class SpotifyClient:
 
             if payload.get("next") is None:
                 break
-            offset += limit
+            offset += PLAYLIST_ITEMS_PAGE
 
         return tracks
 
-    async def _clear_playlist_tracks(self, playlist_id: str) -> None:
-        offset = 0
-        limit = 100
+    async def _clear_playlist_items(self, playlist_id: str) -> None:
+        items_path = _playlist_items_path(playlist_id)
 
         while True:
             payload = await self._request(
                 "GET",
-                f"/playlists/{playlist_id}/tracks",
-                params={"limit": limit, "offset": offset, "fields": "items(track(uri)),total,next"},
+                items_path,
+                params={
+                    "limit": PLAYLIST_ITEMS_PAGE,
+                    "offset": 0,
+                    "fields": "items(item(uri),track(uri)),total,next",
+                },
             )
-            items = payload.get("items", [])
-            if not items:
+            entries = payload.get("items", [])
+            if not entries:
                 break
 
-            tracks_to_remove = [
-                {"uri": item["track"]["uri"]}
-                for item in items
-                if item.get("track") and item["track"].get("uri")
-            ]
-            if tracks_to_remove:
-                await self._request(
-                    "DELETE",
-                    f"/playlists/{playlist_id}/tracks",
-                    json={"tracks": tracks_to_remove},
-                )
+            items_to_remove = []
+            for entry in entries:
+                track = _entry_track(entry)
+                if track and track.get("uri"):
+                    items_to_remove.append({"uri": track["uri"]})
 
-            if payload.get("next") is None:
+            if not items_to_remove:
                 break
-            offset += limit
+
+            await self._request(
+                "DELETE",
+                items_path,
+                json={"items": items_to_remove},
+            )
 
     async def apply_sorted_tracks(self, playlist_id: str, uris: list[str]) -> None:
         current_tracks = await self.get_playlist_tracks(playlist_id)
@@ -169,18 +216,20 @@ class SpotifyClient:
         if current_uris == uris:
             return
 
-        if len(uris) <= 100 and len(current_uris) <= 100:
+        items_path = _playlist_items_path(playlist_id)
+
+        if len(uris) <= PLAYLIST_ITEMS_BATCH and len(current_uris) <= PLAYLIST_ITEMS_BATCH:
             await self._request(
                 "PUT",
-                f"/playlists/{playlist_id}/tracks",
+                items_path,
                 json={"uris": uris},
             )
             return
 
-        await self._clear_playlist_tracks(playlist_id)
-        for index in range(0, len(uris), 100):
+        await self._clear_playlist_items(playlist_id)
+        for index in range(0, len(uris), PLAYLIST_ITEMS_BATCH):
             await self._request(
                 "POST",
-                f"/playlists/{playlist_id}/tracks",
-                json={"uris": uris[index : index + 100]},
+                items_path,
+                json={"uris": uris[index : index + PLAYLIST_ITEMS_BATCH]},
             )

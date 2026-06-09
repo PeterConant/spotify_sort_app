@@ -57,7 +57,6 @@ class PlaylistSummary(BaseModel):
     owner: str
     public: bool
     collaborative: bool
-    track_count: int
     snapshot_id: str | None = None
 
 

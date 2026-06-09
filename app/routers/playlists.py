@@ -27,7 +27,6 @@ async def get_playlist(request: Request, playlist_id: str) -> PlaylistSummary:
         owner=payload["owner"]["display_name"] or payload["owner"]["id"],
         public=bool(payload.get("public")),
         collaborative=bool(payload.get("collaborative")),
-        track_count=payload["tracks"]["total"],
         snapshot_id=payload.get("snapshot_id"),
     )
 
@@ -41,7 +40,8 @@ async def sort_playlist(
     access_token = await get_valid_access_token(request)
     client = SpotifyClient(access_token)
 
-    playlist = await client.get_playlist(playlist_id)
+    user = await client.get_current_user()
+    playlist = await client.ensure_playlist_modifiable(playlist_id, user["id"])
     tracks = await client.get_playlist_tracks(playlist_id)
     sorted_tracks = sort_tracks(tracks, by=body.by, order=body.order)
 
